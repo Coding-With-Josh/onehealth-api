@@ -30,10 +30,20 @@ class CreateAccessRequestSerializer(serializers.Serializer):
 class AccessGrantSerializer(serializers.ModelSerializer):
     access_request = AccessRequestSerializer(read_only=True)
     is_active = serializers.BooleanField(read_only=True)
+    # Read-only display fields so staff dashboards can render patient lists
+    # without N+1 profile lookups. Sourced from already-selected relations;
+    # zero input surface (read_only, no create/update impact).
+    patient_name = serializers.CharField(source="access_request.patient.full_name", read_only=True)
+    patient_date_of_birth = serializers.DateField(source="access_request.patient.date_of_birth", read_only=True)
+    visit_status = serializers.CharField(source="access_request.visit.status", read_only=True)
 
     class Meta:
         model = AccessGrant
-        fields = ["id", "access_request", "access_level", "granted_at", "granted_by", "revoked_at", "revoked_by", "is_active"]
+        fields = [
+            "id", "access_request", "access_level", "granted_at", "granted_by",
+            "revoked_at", "revoked_by", "is_active",
+            "patient_name", "patient_date_of_birth", "visit_status",
+        ]
 
 
 class EmergencyContactSerializer(serializers.ModelSerializer):

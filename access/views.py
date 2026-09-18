@@ -342,7 +342,6 @@ def hospital_patient_profile(request, patient_id):
         "date_of_birth": patient.date_of_birth,
         "gender": patient.gender,
         "blood_type": patient.blood_type,
-        "genotype": patient.genotype,
         "residential_address": patient.residential_address,
     }
     return success_response(data, "Patient profile retrieved successfully.")

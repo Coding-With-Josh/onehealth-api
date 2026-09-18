@@ -14,6 +14,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config('SECRET_KEY')
 
+# Groq API key for the staff AI clinical-summary feature. Server-side only —
+# never exposed to the client (access/views.py reads it from settings).
+GROQ_API_KEY = config('GROQ_API_KEY', default='')
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', cast=bool)
 

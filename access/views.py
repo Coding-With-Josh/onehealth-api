@@ -1,3 +1,7 @@
+import json
+import urllib.error
+import urllib.request
+
 from django.conf import settings
 from django.db import transaction
 from django.shortcuts import get_object_or_404
@@ -7,7 +11,7 @@ from drf_yasg.utils import swagger_auto_schema
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework import throttling
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 
 from core.responses import success_response
@@ -342,7 +346,6 @@ def hospital_patient_profile(request, patient_id):
         "date_of_birth": patient.date_of_birth,
         "gender": patient.gender,
         "blood_type": patient.blood_type,
-        "residential_address": patient.residential_address,
     }
     return success_response(data, "Patient profile retrieved successfully.")
 
@@ -388,6 +391,139 @@ def hospital_patient_records(request, patient_id):
         visit=visit,
     )
     return success_response(MedicalRecordSerializer(record).data, "Patient medical record added successfully.", status.HTTP_201_CREATED)
+
+
+# ---------------------------------------------------------------------------
+# AI clinical summary (Groq)
+#
+# Stateless: the summary is generated on demand and NEVER persisted — a
+# clinician re-reads the raw records to verify anything the model says.
+# The records (entry_type + description + verification status + date) go
+# to Groq as a bounded context (~20 most recent, descriptions capped at
+# 500 chars). Patient identity is NOT sent. The API key lives only in the
+# environment; it is never exposed to the client, and no error path leaks
+# it or the records back to the caller.
+# ---------------------------------------------------------------------------
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_TIMEOUT_SECONDS = 30
+MAX_RECORDS_FOR_SUMMARY = 20
+MAX_DESCRIPTION_CHARS = 500
+
+GROQ_SYSTEM_PROMPT = (
+    "You are a senior clinician reviewing a patient's chart. "
+    "Summarize the medical records below into a concise clinical brief. "
+    "Include: current conditions, medications, allergies, recent notes, and any red "
+    "flags. Do NOT invent facts that are not present in the records. If records "
+    "conflict, say so. End with a one-line 'Suggested follow-up' based only on the "
+    "records. Keep the whole summary under 250 words."
+)
+
+
+@swagger_auto_schema(
+    method="post",
+    tags=["Hospital Patients"],
+    operation_summary="Generate an AI clinical summary of a patient's records",
+    operation_description="""
+    Generates an AI summary of the patient's medical records using Groq.
+    Requires the same active access grant as reading the patient's chart.
+
+    **Authentication:** Required.
+
+    **Required Role:** Hospital Staff of a verified hospital with an active grant.
+    """,
+    security=[{"Bearer": []}],
+    responses={
+        200: openapi.Response(description="AI summary generated successfully"),
+        403: openapi.Response(description="No active access grant for this patient"),
+        504: openapi.Response(description="AI service timed out"),
+    },
+)
+@api_view(["POST"])
+@permission_classes([IsHospitalStaff, IsFromVerifiedHospital])
+def hospital_patient_summary(request, patient_id):
+    staff = staff_for_request(request)
+    patient = get_object_or_404(PatientProfile, pk=patient_id)
+
+    # Complete mediation: identical grant gate to hospital_patient_records.
+    grant = AccessGrant.objects.filter(
+        access_request__patient=patient,
+        access_request__hospital=staff.hospital,
+        revoked_at__isnull=True,
+        access_request__visit__status=Visit.Status.ACTIVE,
+    ).select_related("access_request").order_by("-granted_at").first()
+    if not grant:
+        raise PermissionDenied("An active access grant is required to summarize this patient's records.")
+
+    api_key = getattr(settings, "GROQ_API_KEY", "")
+    if not api_key:
+        raise APIException("AI service is not configured.")
+
+    # Bounded context — the most recent records fit within the model's
+    # window; nothing user-supplied enters the prompt except record data
+    # that is already visible to this staff member.
+    records = list(
+        patient.medical_records.select_related("verified_by_staff", "created_by_staff", "hospital", "visit", "supersedes_entry")
+        .order_by("-created_at")[:MAX_RECORDS_FOR_SUMMARY]
+    )
+    if not records:
+        return success_response({"summary": None}, "No records to summarize.", status.HTTP_200_OK)
+
+    chart_lines = []
+    for r in records:
+        desc = (r.description or "")[:MAX_DESCRIPTION_CHARS]
+        chart_lines.append(
+            f"- [{r.entry_type}] ({r.verification_status}, {r.created_at.date().isoformat()}): {desc}"
+        )
+
+    payload = {
+        "model": GROQ_MODEL,
+        "temperature": 0.7,
+        "max_tokens": 600,
+        "messages": [
+            {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+            {"role": "user", "content": "Patient chart records:\n" + "\n".join(chart_lines)},
+        ],
+    }
+
+    req = urllib.request.Request(
+        GROQ_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    # Fail-closed: every Groq failure path raises a safe, user-facing
+    # error — never the raw exception, the key, or the records.
+    try:
+        with urllib.request.urlopen(req, timeout=GROQ_TIMEOUT_SECONDS) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise APIException("AI service authentication failed. Contact support.") from e
+        if e.code == 429:
+            raise APIException("AI service is rate limited — try again shortly.") from e
+        raise APIException("AI service returned an error — try again.") from e
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise APIException("AI service timed out — try again.") from e
+    except json.JSONDecodeError as e:
+        raise APIException("AI service returned an unreadable response — try again.") from e
+
+    try:
+        summary_text = body["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError) as e:
+        raise APIException("AI service returned an unexpected response — try again.") from e
+
+    log_event(
+        "ai_summary_generated", user_id=request.user, request=request,
+        patient_id=patient.id, hospital_id=staff.hospital_id,
+        target_type="patient", target_id=patient.id,
+    )
+    return success_response({"summary": summary_text}, "AI summary generated successfully.")
 
 
 @swagger_auto_schema(

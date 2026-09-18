@@ -12,6 +12,7 @@ urlpatterns = [
     path("access-grants/hospital/active/", views.hospital_active_grants, name="hospital-active-access-grants"),
     path("patients/<uuid:patient_id>/", views.hospital_patient_profile, name="hospital-patient-profile"),
     path("patients/<uuid:patient_id>/records/", views.hospital_patient_records, name="hospital-patient-records"),
+    path("patients/<uuid:patient_id>/summarize/", views.hospital_patient_summary, name="hospital-patient-summary"),
     path("patients/me/emergency-contacts/", views.emergency_contacts, name="emergency-contacts"),
     path("emergency-contacts/<uuid:contact_id>/", views.delete_emergency_contact, name="delete-emergency-contact"),
     path("emergency-contacts/<uuid:contact_id>/respond/", views.emergency_contact_respond, name="emergency-contact-respond"),

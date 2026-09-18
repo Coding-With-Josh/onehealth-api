@@ -1,0 +1,762 @@
+import secrets
+import uuid
+
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.utils import timezone
+
+from users.models import Hospital, HospitalStaffProfile, PatientProfile
+from visits.models import Visit
+
+
+class EmergencyContact(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    patient = models.ForeignKey(PatientProfile, on_delete=models.PROTECT, related_name="emergency_contacts")
+    full_name = models.CharField(max_length=255)
+    relationship = models.CharField(max_length=100, blank=True)
+    phone_number = models.CharField(max_length=30)
+    email = models.EmailField(blank=True)
+    priority_order = models.PositiveSmallIntegerField(default=1)
+    response_token = models.CharField(max_length=64, unique=True, editable=False)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "emergency_contacts"
+        ordering = ["created_at"]
+
+    def save(self, *args, **kwargs):
+        if not self.response_token:
+            self.response_token = secrets.token_urlsafe(32)
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.full_name} — {self.patient.full_name}"
+
+
+class AccessRequest(models.Model):
+    class RequestType(models.TextChoices):
+        NORMAL = "normal", "Normal"
+        EMERGENCY = "emergency", "Emergency"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        DENIED = "denied", "Denied"
+        EXPIRED = "expired", "Expired"
+
+    class AccessLevel(models.TextChoices):
+        CRITICAL_INFO_ONLY = "critical_info_only", "Critical information only"
+        FULL_RECORD = "full_record", "Full record"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    visit = models.ForeignKey(Visit, on_delete=models.PROTECT, related_name="access_requests")
+    patient = models.ForeignKey(PatientProfile, on_delete=models.PROTECT, related_name="access_requests")
+    hospital = models.ForeignKey(Hospital, on_delete=models.PROTECT, related_name="access_requests")
+    requested_by_staff = models.ForeignKey(
+        HospitalStaffProfile, on_delete=models.PROTECT, related_name="access_requests"
+    )
+    request_type = models.CharField(max_length=20, choices=RequestType.choices, default=RequestType.NORMAL)
+    access_level = models.CharField(max_length=30, choices=AccessLevel.choices, default=AccessLevel.FULL_RECORD)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    code = models.CharField(max_length=6, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+    patient_response_deadline = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "access_requests"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "status"]),
+            models.Index(fields=["hospital", "status"]),
+            models.Index(fields=["visit", "status"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = f"{secrets.randbelow(1000000):06d}"
+        if self.patient_response_deadline is None:
+            from django.conf import settings
+            timeout = getattr(settings, "ACCESS_REQUEST_RESPONSE_TIMEOUT_MINUTES", 15)
+            self.patient_response_deadline = timezone.now() + timezone.timedelta(minutes=timeout)
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def clean(self):
+        errors = {}
+        if self.visit_id:
+            if self.visit.patient_id != self.patient_id:
+                errors["patient"] = "Access request patient must match the visit patient."
+            if self.visit.hospital_id != self.hospital_id:
+                errors["hospital"] = "Access request hospital must match the visit hospital."
+        if self.requested_by_staff_id and self.requested_by_staff.hospital_id != self.hospital_id:
+            errors["requested_by_staff"] = "Requesting staff must belong to the requesting hospital."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.request_type} access — {self.patient.full_name} — {self.hospital.name}"
+
+
+class AccessGrant(models.Model):
+    class GrantedBy(models.TextChoices):
+        PATIENT = "patient", "Patient"
+        EMERGENCY_CONTACT = "emergency_contact", "Emergency contact"
+
+    class RevokedBy(models.TextChoices):
+        PATIENT = "patient", "Patient"
+        SYSTEM = "system", "System / checkout"
+        ESCALATION = "escalation", "Escalation"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    access_request = models.OneToOneField(AccessRequest, on_delete=models.PROTECT, related_name="grant")
+    access_level = models.CharField(max_length=30, choices=AccessRequest.AccessLevel.choices)
+    granted_at = models.DateTimeField(default=timezone.now)
+    granted_by = models.CharField(max_length=30, choices=GrantedBy.choices)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.CharField(max_length=30, choices=RevokedBy.choices, null=True, blank=True)
+
+    class Meta:
+        db_table = "access_grants"
+        indexes = [models.Index(fields=["revoked_at"])]
+
+    @property
+    def is_active(self):
+        return (
+            self.revoked_at is None
+            and self.access_request.visit.status == Visit.Status.ACTIVE
+            and self.access_request.hospital.verification_status == Hospital.VerificationStatus.VERIFIED
+        )
+
+    def revoke(self, revoked_by):
+        if self.revoked_at is None:
+            self.revoked_at = timezone.now()
+            self.revoked_by = revoked_by
+            self.save(update_fields=["revoked_at", "revoked_by"])
+
+    def __str__(self):
+        return f"Grant {self.id} — {self.access_request.patient.full_name}"
+
+
+class EmergencyEscalation(models.Model):
+    class Stage(models.TextChoices):
+        PATIENT_NOTIFIED = "patient_notified", "Patient notified"
+        EMERGENCY_CONTACT_NOTIFIED = "emergency_contact_notified", "Emergency contact notified"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    access_request = models.OneToOneField(AccessRequest, on_delete=models.PROTECT, related_name="escalation")
+    stage = models.CharField(max_length=40, choices=Stage.choices)
+    triggered_at = models.DateTimeField(default=timezone.now)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        db_table = "emergency_escalations"
+        indexes = [models.Index(fields=["stage", "resolved_at"])]
+
+    def resolve(self, resolved_by):
+        self.resolved_at = timezone.now()
+        self.resolved_by = str(resolved_by)
+        self.save(update_fields=["resolved_at", "resolved_by"])
+
+    def __str__(self):
+        return f"Escalation — {self.access_request.patient.full_name} — {self.stage}"
+import uuid
+
+from django.conf import settings
+from django.db import models
+
+from users.models import Hospital, PatientProfile
+
+
+class AuditLog(models.Model):
+    """Append-only, queryable audit trail for security and accountability."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="audit_events")
+    hospital = models.ForeignKey(Hospital, null=True, blank=True, on_delete=models.SET_NULL, related_name="audit_events")
+    patient = models.ForeignKey(PatientProfile, null=True, blank=True, on_delete=models.SET_NULL, related_name="audit_events")
+    action = models.CharField(max_length=100, db_index=True)
+    target_type = models.CharField(max_length=100, blank=True)
+    target_id = models.CharField(max_length=100, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "audit_logs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["hospital", "created_at"]),
+            models.Index(fields=["patient", "created_at"]),
+            models.Index(fields=["actor", "created_at"]),
+            models.Index(fields=["action", "created_at"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValueError("Audit logs are append-only and cannot be edited.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValueError("Audit logs are append-only and cannot be deleted.")
+
+    def __str__(self):
+        return f"{self.created_at} — {self.action}"
+
+import secrets
+import uuid
+from datetime import timedelta
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.utils import timezone
+
+from users.models import PatientProfile
+
+
+class PatientCard(models.Model):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        REVOKED = "revoked", "Revoked"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    patient = models.ForeignKey(PatientProfile, on_delete=models.PROTECT, related_name="cards")
+    card_reference = models.CharField(max_length=40, unique=True, editable=False)
+    issued_at = models.DateTimeField(default=timezone.now, editable=False)
+    renewed_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.ACTIVE)
+
+    class Meta:
+        db_table = "patient_cards"
+        ordering = ["-issued_at"]
+        indexes = [
+            models.Index(fields=["patient", "status"]),
+            models.Index(fields=["card_reference"]),
+            models.Index(fields=["expires_at"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.card_reference:
+            self.card_reference = f"OH-{secrets.token_urlsafe(18)}"
+        if not self.expires_at:
+            days = getattr(settings, "PATIENT_CARD_VALIDITY_DAYS", 365)
+            self.expires_at = timezone.now() + timedelta(days=days)
+        self.full_clean()
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            # Card lifecycle changes are intentionally explicit in the service/views.
+            # Prevent arbitrary edits through model.save().
+            raise ValidationError("Existing cards cannot be edited directly. Use issue, renew, or revoke actions.")
+        return super().save(*args, **kwargs)
+
+    def renew(self):
+        if self.status != self.Status.ACTIVE:
+            raise ValidationError("A revoked card cannot be renewed.")
+        days = getattr(settings, "PATIENT_CARD_VALIDITY_DAYS", 365)
+        now = timezone.now()
+        self.renewed_at = now
+        self.expires_at = now + timedelta(days=days)
+        type(self).objects.filter(pk=self.pk).update(
+            renewed_at=self.renewed_at,
+            expires_at=self.expires_at,
+        )
+        return self
+
+    def revoke(self):
+        if self.status != self.Status.REVOKED:
+            type(self).objects.filter(pk=self.pk).update(status=self.Status.REVOKED)
+            self.status = self.Status.REVOKED
+        return self
+
+    @property
+    def is_active(self):
+        return self.status == self.Status.ACTIVE and self.expires_at > timezone.now()
+
+    def __str__(self):
+        return f"{self.card_reference} — {self.patient.full_name}"
+
+from django.core.exceptions import ValidationError
+from django.db import models
+import uuid
+from django.utils import timezone
+
+from users.models import Hospital, HospitalStaffProfile, PatientProfile
+
+
+class MedicalRecord(models.Model):
+    class VerificationStatus(models.TextChoices):
+        SELF_REPORTED = "self_reported", "Self-reported"
+        DOCTOR_VERIFIED = "doctor_verified", "Doctor-verified"
+
+    id = models.UUIDField(primary_key=True, editable=False, default=uuid.uuid4)
+    patient = models.ForeignKey(
+        PatientProfile,
+        on_delete=models.PROTECT,
+        related_name="medical_records",
+    )
+    entry_type = models.CharField(max_length=100)
+    description = models.TextField()
+    verification_status = models.CharField(
+        max_length=30,
+        choices=VerificationStatus.choices,
+        default=VerificationStatus.SELF_REPORTED,
+    )
+    verified_by_staff = models.ForeignKey(
+        HospitalStaffProfile,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="verified_medical_records",
+    )
+    created_by_staff = models.ForeignKey(
+        HospitalStaffProfile,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="created_medical_records",
+    )
+    visit = models.ForeignKey(
+        "visits.Visit",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="medical_records",
+    )
+    hospital = models.ForeignKey(
+        Hospital,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="medical_records",
+    )
+    supersedes_entry = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="superseding_entries",
+    )
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+
+    class Meta:
+        db_table = "medical_records"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "created_at"]),
+            models.Index(fields=["patient", "entry_type"]),
+            models.Index(fields=["verification_status"]),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.visit_id and self.visit.patient_id != self.patient_id:
+            errors["visit"] = "Visit must belong to the same patient."
+        if self.visit_id and self.visit.status == "checked_out" and self.created_by_staff_id:
+            errors["visit"] = "Clinical records cannot be added to a checked-out visit."
+        if self.visit_id and self.hospital_id and self.visit.hospital_id != self.hospital_id:
+            errors["hospital"] = "Hospital must match the visit hospital."
+        if self.visit_id and self.created_by_staff_id and self.visit.hospital_id != self.created_by_staff.hospital_id:
+            errors["created_by_staff"] = "Creating staff must belong to the visit hospital."
+        if self.supersedes_entry_id:
+            if self.supersedes_entry_id == self.pk:
+                errors["supersedes_entry"] = "A record cannot supersede itself."
+            elif self.supersedes_entry and self.supersedes_entry.patient_id != self.patient_id:
+                errors["supersedes_entry"] = "A record can only supersede an entry belonging to the same patient."
+
+        if self.verification_status == self.VerificationStatus.DOCTOR_VERIFIED and not self.verified_by_staff_id:
+            errors["verified_by_staff"] = "Doctor-verified records must identify the verifying staff member."
+
+        if self.verified_by_staff and self.verified_by_staff.role != HospitalStaffProfile.Role.DOCTOR:
+            errors["verified_by_staff"] = "Only a doctor can verify a medical record."
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("Medical records are append-only and cannot be edited.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Medical records are append-only and cannot be deleted.")
+
+    def __str__(self):
+        return f"{self.entry_type} — {self.patient.full_name}"
+
+import uuid
+
+from django.contrib.auth.base_user import AbstractBaseUser
+from django.contrib.auth.models import PermissionsMixin
+from django.db import models
+from django.utils import timezone
+from rest_framework_simplejwt.tokens import RefreshToken
+from .managers import CustomUserManager
+
+
+class User(AbstractBaseUser, PermissionsMixin):
+    """
+    The ONLY table that can actually log in to the platform.
+
+    IMPORTANT: We are NOT using Django's built-in User model. That model
+    hard-codes `username` as the login field and has no concept of
+    "what kind of account is this" — both of which we need. Instead we
+    build our own minimal account model and attach a *profile* model to
+    it depending on what kind of user it is (see PatientProfile /
+    HospitalStaffProfile below).
+
+    Think of CustomUser as "can this person log in, and as what role" —
+    nothing medical or hospital-specific belongs on this model.
+    """
+
+    class UserType(models.TextChoices):
+        PATIENT = "patient", "Patient"
+        HOSPITAL_STAFF = "hospital_staff", "Hospital Staff"
+        PLATFORM_ADMIN = "platform_admin", "Platform Admin"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # UUID instead of auto-increment int: prevents anyone from guessing
+    # "user id 1, 2, 3..." and probing the API for valid accounts —
+    # matters a lot for a medical records system.
+
+    email = models.EmailField(unique=True, db_index=True)
+    phone_number = models.CharField(max_length=20, unique=True)
+
+    user_type = models.CharField(max_length=20, choices=UserType.choices)
+
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Unchecking this disables login WITHOUT deleting the account or its data.",
+    )
+    is_staff = models.BooleanField(
+        default=False,
+        help_text="Django admin site access only — unrelated to hospital staff.",
+    )
+
+    # Set True the moment a hospital-staff account is created by an admin
+    # with a system-generated temporary password. Forces a password change
+    # before they can do anything else. See views.ChangePasswordView.
+    must_change_password = models.BooleanField(default=False)
+
+    date_joined = models.DateTimeField(default=timezone.now)
+
+    objects = CustomUserManager()
+
+    USERNAME_FIELD = "email"   # log in with email, not username
+    REQUIRED_FIELDS = []       # no extra fields required for createsuperuser besides email/password
+
+    def __str__(self):
+        return f"{self.email} ({self.user_type})"
+
+    def auth_tokens(self):
+        refresh = RefreshToken.for_user(self)
+
+        # update last login date
+        self.last_login = timezone.now()
+        self.save()
+        
+        return {
+            "access": str(refresh.access_token),
+            "refresh": str(refresh)
+        }
+
+
+class Hospital(models.Model):
+    """
+    An organization, NOT a user. Nobody logs in "as a hospital" — staff
+    members log in individually and are linked to a Hospital via
+    HospitalStaffProfile. This model just holds the institution's own
+    identity + verification status.
+    """
+
+    class VerificationStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        VERIFIED = "verified", "Verified"
+        REJECTED = "rejected", "Rejected"
+        SUSPENDED = "suspended", "Suspended"
+        # SUSPENDED covers the edge case we flagged earlier: a hospital's
+        # registration later lapses/gets revoked. Don't delete the row,
+        # just flip status — keeps historical records intact.
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    name = models.CharField(max_length=255)
+    registration_number = models.CharField(
+        max_length=100,
+        unique=True,
+        help_text="National Health Facility Registry ID — the source of truth we verify against.",
+    )
+    phermc_number = models.CharField(max_length=100, blank=True)
+    cac_number = models.CharField(max_length=100, blank=True)
+
+    address = models.CharField(max_length=500, blank=True)
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+
+    verification_status = models.CharField(
+        max_length=20, choices=VerificationStatus.choices, default=VerificationStatus.PENDING
+    )
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+
+class PatientProfile(models.Model):
+    """
+    Medical-identity data for a patient. Deliberately separate from
+    CustomUser because NOT every patient profile has a login:
+
+    - A self-managed adult patient: has a `user` (their own CustomUser).
+    - A dependent (child): `user` is NULL. Access is entirely through
+      `guardian` instead. This is what lets us register a newborn
+      without needing an email for them.
+    - A community-enrolled patient (elderly/non-literate, onboarded by
+      a doctor at an outreach event): may or may not have a `user`
+      depending on whether they end up with their own login later.
+      `enrolled_by_staff` records which staff member created it, for
+      the consent/accountability trail we discussed.
+    """
+
+    class AccountType(models.TextChoices):
+        SELF_MANAGED = "self_managed", "Self Managed"
+        DEPENDENT = "dependent", "Dependent"
+        COMMUNITY_ENROLLED = "community_enrolled", "Community Enrolled"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Nullable on purpose — see docstring above.
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, null=True, blank=True, related_name="patient_profile"
+    )
+
+    full_name = models.CharField(max_length=255)
+    date_of_birth = models.DateField()
+    gender = models.CharField(max_length=20, blank=True)
+    blood_type = models.CharField(max_length=5, blank=True)
+
+    account_type = models.CharField(max_length=20, choices=AccountType.choices)
+
+    # Only set when account_type == DEPENDENT. Points at the guardian's
+    # OWN PatientProfile (a guardian is a patient too, with extra rights
+    # over this row). Enforced in serializers/validators, not the DB,
+    # since Django doesn't easily support conditional-required FKs.
+    guardian = models.ForeignKey(
+        "self", on_delete=models.CASCADE, null=True, blank=True, related_name="dependents"
+    )
+
+    # Only set when account_type == COMMUNITY_ENROLLED — which staff
+    # member created this profile on the patient's behalf. Doubles as
+    # part of the consent/audit trail for that enrollment path.
+    enrolled_by_staff = models.ForeignKey(
+        "HospitalStaffProfile", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.full_name
+
+
+class HospitalStaffProfile(models.Model):
+    """
+    A staff member belonging to a Hospital. Always has a `user` —
+    unlike PatientProfile, staff always log in individually (nobody
+    acts "on behalf of" hospital staff the way a guardian does for a
+    dependent).
+    """
+
+    class Role(models.TextChoices):
+        DOCTOR = "doctor", "Doctor"
+        NURSE = "nurse", "Nurse"
+        ADMIN = "admin", "Hospital Admin"
+        # ADMIN = the account that manages the hospital's own account
+        # (adds/removes staff). Distinct from PLATFORM_ADMIN on CustomUser,
+        # which is US (the company), not the hospital.
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="staff_profile")
+    hospital = models.ForeignKey(Hospital, on_delete=models.CASCADE, related_name="staff")
+
+    full_name = models.CharField(max_length=255)
+    role = models.CharField(max_length=20, choices=Role.choices)
+
+    # Required for doctors specifically — this is what lets a DOCTOR
+    # (and only a doctor) mark a medical record entry as "verified"
+    # elsewhere in the system. Kept optional at the DB level because
+    # nurses/admins won't have one, validated per-role in the serializer.
+    professional_license_number = models.CharField(max_length=100, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.full_name} — {self.hospital.name} ({self.role})"
+import uuid
+from decimal import Decimal
+
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.utils import timezone
+
+from users.models import Hospital, HospitalStaffProfile, PatientProfile
+
+
+class Visit(models.Model):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        CHECKED_OUT = "checked_out", "Checked out"
+        ESCALATED = "escalated", "Escalated"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    patient = models.ForeignKey(PatientProfile, on_delete=models.PROTECT, related_name="visits")
+    hospital = models.ForeignKey(Hospital, on_delete=models.PROTECT, related_name="visits")
+    admitted_at = models.DateTimeField(default=timezone.now)
+    checked_out_at = models.DateTimeField(null=True, blank=True)
+    checkout_requested_by_patient_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.ACTIVE)
+    created_by_staff = models.ForeignKey(
+        HospitalStaffProfile,
+        on_delete=models.PROTECT,
+        related_name="created_visits",
+    )
+
+    class Meta:
+        db_table = "visits"
+        ordering = ["-admitted_at"]
+        indexes = [
+            models.Index(fields=["patient", "admitted_at"]),
+            models.Index(fields=["hospital", "status"]),
+        ]
+
+    def clean(self):
+        if self.created_by_staff_id and self.hospital_id != self.created_by_staff.hospital_id:
+            raise ValidationError({"created_by_staff": "Visit staff must belong to the visit hospital."})
+        if self.status == self.Status.ACTIVE and self.checked_out_at:
+            raise ValidationError({"checked_out_at": "An active visit cannot have a checkout time."})
+        if self.status == self.Status.CHECKED_OUT and not self.checked_out_at:
+            raise ValidationError({"checked_out_at": "A checked-out visit must have a checkout time."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Visit {self.id} — {self.patient.full_name} at {self.hospital.name}"
+
+
+class Vital(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    visit = models.ForeignKey(Visit, on_delete=models.PROTECT, related_name="vitals")
+    recorded_by_staff = models.ForeignKey(
+        HospitalStaffProfile,
+        on_delete=models.PROTECT,
+        related_name="recorded_vitals",
+    )
+    recorded_at = models.DateTimeField(default=timezone.now, editable=False)
+
+    blood_pressure_systolic = models.PositiveSmallIntegerField(null=True, blank=True)
+    blood_pressure_diastolic = models.PositiveSmallIntegerField(null=True, blank=True)
+    heart_rate = models.PositiveSmallIntegerField(null=True, blank=True)
+    temperature_c = models.DecimalField(max_digits=4, decimal_places=1, null=True, blank=True)
+    respiratory_rate = models.PositiveSmallIntegerField(null=True, blank=True)
+    oxygen_saturation = models.DecimalField(max_digits=4, decimal_places=1, null=True, blank=True)
+    weight_kg = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    height_cm = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "vitals"
+        ordering = ["-recorded_at"]
+        indexes = [models.Index(fields=["visit", "recorded_at"])]
+
+    def clean(self):
+        errors = {}
+        if self.recorded_by_staff_id and self.visit_id and self.recorded_by_staff.hospital_id != self.visit.hospital_id:
+            errors["recorded_by_staff"] = "Staff member must belong to the visit hospital."
+        if self.visit_id and self.visit.status == Visit.Status.CHECKED_OUT:
+            errors["visit"] = "Vitals cannot be added to a checked-out visit."
+        if self.blood_pressure_systolic is None and self.blood_pressure_diastolic is not None:
+            errors["blood_pressure_systolic"] = "Systolic pressure is required when diastolic pressure is provided."
+        if self.blood_pressure_diastolic is None and self.blood_pressure_systolic is not None:
+            errors["blood_pressure_diastolic"] = "Diastolic pressure is required when systolic pressure is provided."
+        if self.oxygen_saturation is not None and not Decimal("0") <= self.oxygen_saturation <= Decimal("100"):
+            errors["oxygen_saturation"] = "Oxygen saturation must be between 0 and 100."
+        if self.temperature_c is not None and not Decimal("20") <= self.temperature_c <= Decimal("50"):
+            errors["temperature_c"] = "Temperature must be between 20 and 50 °C."
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("Vitals are append-only and cannot be edited.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Vitals are append-only and cannot be deleted.")
+
+    def __str__(self):
+        return f"Vitals — {self.visit.patient.full_name} — {self.recorded_at:%Y-%m-%d %H:%M}"
+
+
+class Medication(models.Model):
+    class Status(models.TextChoices):
+        CURRENT = "current", "Current"
+        PREVIOUS = "previous", "Previous"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    patient = models.ForeignKey(PatientProfile, on_delete=models.PROTECT, related_name="medications")
+    visit = models.ForeignKey(Visit, on_delete=models.PROTECT, related_name="medications", null=True, blank=True)
+    medication = models.CharField(max_length=255)
+    dose = models.CharField(max_length=100, blank=True)
+    route = models.CharField(max_length=100, blank=True)
+    frequency = models.CharField(max_length=100, blank=True)
+    duration = models.CharField(max_length=100, blank=True)
+    reason = models.CharField(max_length=500, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.CURRENT)
+    prescribed_by_staff = models.ForeignKey(
+        HospitalStaffProfile,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="prescribed_medications",
+    )
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+
+    class Meta:
+        db_table = "medications"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "status"]),
+            models.Index(fields=["patient", "created_at"]),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.visit_id and self.visit.patient_id != self.patient_id:
+            errors["visit"] = "Medication visit must belong to the same patient."
+        if self.prescribed_by_staff_id and self.visit_id:
+            if self.prescribed_by_staff.hospital_id != self.visit.hospital_id:
+                errors["prescribed_by_staff"] = "Prescribing staff must belong to the visit hospital."
+        if self.visit_id and self.visit.status == Visit.Status.CHECKED_OUT:
+            errors["visit"] = "Medication cannot be added to a checked-out visit."
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("Medication records are append-only and cannot be edited.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Medication records are append-only and cannot be deleted.")
+
+    def __str__(self):
+        return f"{self.medication} — {self.patient.full_name} ({self.status})"
